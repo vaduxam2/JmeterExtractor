@@ -1,0 +1,270 @@
+/**
+ * VER 1.0
+ */
+
+import groovy.transform.CompileStatic
+import org.apache.jmeter.protocol.http.control.Header
+import org.apache.jmeter.protocol.http.control.HeaderManager
+import org.apache.jmeter.protocol.http.sampler.HTTPSamplerProxy
+import org.apache.jmeter.samplers.SampleResult as SampleRes
+import org.apache.jmeter.threads.JMeterContext
+import java.util.concurrent.ThreadLocalRandom
+import org.apache.jmeter.threads.JMeterVariables
+import org.slf4j.Logger
+
+// ==========================================================================================
+/**
+ * Статический класс-обёртка для запуска процесса ожидания ответа от сервера.
+ * Предоставляет единую точку входа из JSR223 Sampler.
+ * Параметры метода — имена переменных JMeter, из которых будут извлечены значения,
+ * что позволяет гибко настраивать тест без изменения кода.
+ */
+@CompileStatic
+class GetDummy {
+    public static void waitDummyResponse(
+            SampleRes sampleResult,          // Результат текущего сэмплера (для заполнения данными) - sampleResult
+            JMeterContext ctx,               // Контекст JMeter (для доступа к переменным) - ctx
+            String desktopId = "desktopId",  // Имя переменной с идентификатором рабочего стола - "Desktop_142"
+            String server = "server",        // Имя переменной с адресом сервера -
+            String port = "port",            // Имя переменной с портом - "4005"
+            String poib_remote_user = "poib_remote_user", // Имя переменной с пользователем - "69d20ce2-c7a3-4694-a0ae-e4280487d344"
+            String Cookie = "Cookie",        // Имя переменной с начальным значением Cookie (может быть пустым) - "JSESSIONID=node0si9tr49cy8olrhm7cbgeisc275.node0"
+            String importTimeout = "importTimeout",       // Имя переменной с таймаутом (сек) - "120"
+            String wait = "wait",            // Имя переменной с интервалом опроса (мс) - "1000"
+            String strOk = "Успешно завершена",       // Имя переменной с текстом для успешной проверки ответа
+            String strFail = "Завершена с ошибками",  // Имя переменной с текстом для неуспешной проверки ответа
+            String path = "/EXP/zkau"        // Путь запроса (по умолчанию /EXP/zkau)
+    ) {
+        // Создаём экземпляр основного класса и запускаем процесс
+        new Dummy(sampleResult, ctx, desktopId, server, port, poib_remote_user, Cookie, importTimeout, wait, strOk, strFail, path)
+    }
+}
+
+// ==========================================================================================
+/**
+ * Основной класс, реализующий логику опроса сервера до получения финального статуса
+ * или истечения таймаута.
+ */
+@CompileStatic
+class Dummy {
+    private static Logger log
+    Dummy(
+            SampleRes sampleResult,          // Результат текущего сэмплера
+            JMeterContext ctx,               // Контекст потока
+            String desktopId,                // Имя переменной с desktopId - "Desktop_142"
+            String server,                   // Имя переменной с сервером -
+            String port,                     // Имя переменной с портом - "4005"
+            String poib_remote_user,         // Имя переменной с пользователем - "69d20ce2-c7a3-4694-a0ae-e4280487d344"
+            String Cookie,                   // Имя переменной с начальной Cookie - "JSESSIONID=node0si9tr49cy8olrhm7cbgeisc275.node0"
+            String importTimeout,            // Имя переменной с таймаутом - "120"
+            String wait,                     // Имя переменной с интервалом - "1000"
+            String strOk,                    // Имя переменной с текстом для успешной проверки ответа - "Успешно завершена"
+            String strFail,                  // Имя переменной с текстом для неуспешной проверки ответа - "Завершена с ошибками"
+            String path                      // Путь запроса (передан как строка, но может быть и фиксированным) - "/EXP/zkau"
+    ) {
+        // Получаем доступ к переменным JMeter через контекст
+        JMeterVariables vars = ctx.getVariables()
+        String timeout = (vars.get(importTimeout) ?: "60")
+        int timeOut = timeout as Integer
+
+        // Создаём вспомогательный объект для хранения результата и настроек
+        ResultSampler resultSampler = new ResultSampler(
+                sampleResult,
+                timeOut,  // таймаут ожидания, по умолчанию 60 сек
+                vars.get(Cookie) ?: ""  // начальное значение Cookie (может быть пустым)
+        )
+
+        // Извлекаем остальные параметры из переменных JMeter с значениями по умолчанию
+        String srv = vars.get(server)                  // сервер
+        int prt = vars.get(port) as int                // порт
+        String user = vars.get(poib_remote_user)       // пользователь для заголовка poib-remote-user
+        int waitMs = (vars.get(wait) ?: "1000") as int // интервал опроса, по умолчанию 1000 мс
+        long endTime = System.currentTimeMillis() + timeOut * 1000L // время окончания ожидания
+        String dId = vars.get(desktopId)
+
+        // --- Создание HTTP-сэмплера с параметрами запроса ---
+        HTTPSamplerProxy httpSampler = new HTTPSamplerProxy()
+        httpSampler.setDomain(srv)
+        httpSampler.setPort(prt)
+        httpSampler.setProtocol("http")
+        httpSampler.setPath(path)
+        httpSampler.setMethod("POST")
+        httpSampler.setFollowRedirects(true)
+        httpSampler.setUseKeepAlive(true)
+        httpSampler.setPostBodyRaw(false)  // параметры передаются как обычные form-data
+        httpSampler.setConnectTimeout(timeout)
+        httpSampler.setResponseTimeout(timeout)
+        // Добавляем параметры тела запроса (dtid, cmd_0, opt_0)
+        httpSampler.addArgument("dtid", dId)
+        httpSampler.addArgument("cmd_0", "dummy")
+        httpSampler.addArgument("opt_0", "i")
+
+        // --- Формирование заголовков запроса ---
+        HeaderManager headers = new HeaderManager()
+        headers.add(new Header("poib-remote-user", user))
+        headers.add(new Header("User-Agent", "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36"))
+        headers.add(new Header("Accept-Encoding", "gzip, deflate"))
+        headers.add(new Header("Accept-Language", "ru"))
+        headers.add(new Header("Referer", "http://${srv}:${prt}/"))
+        headers.add(new Header("Origin", "http://${srv}:${prt}"))
+        headers.add(new Header("Accept", "*/*"))
+        headers.add(new Header("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8"))
+        headers.add(new Header("Cookie", resultSampler.cookie)) // начальная Cookie (может быть пустой)
+        httpSampler.setHeaderManager(headers)
+
+        // --- Переменные для хранения результата ---
+        SampleRes response = null
+        String responseStr = ""
+        boolean status = false  // флаг успешного завершения (по умолчанию false)
+
+        // --- Цикл опроса ---
+        while (System.currentTimeMillis() < endTime) {
+            // Генерируем новый ZK-SID и добавляем в заголовки (удаляем старый, если был)
+            headers.removeHeaderNamed("ZK-SID")
+            headers.add(new Header("ZK-SID", ThreadLocalRandom.current().nextInt(1_000_000_000).toString()))
+
+            // Выполняем запрос
+            response = httpSampler.sample(null)
+            responseStr = response.getResponseDataAsString()
+
+            // ############################################################################
+            // Формируем подробное лог-сообщение для отладки
+            StringBuilder logMsg = new StringBuilder()
+            logMsg.append("\n========== ЗАПРОС (Итерация ${resultSampler.iteration + 1})  ${srv} ==========\n")
+            logMsg.append("🌐 URL: ${httpSampler.getProtocol()}://${httpSampler.getDomain()}:${httpSampler.getPort()}${httpSampler.getPath()}\n")
+            logMsg.append("📝 METHOD: ${httpSampler.getMethod()}\n")
+
+            logMsg.append("\n📌 ЗАГОЛОВКИ ЗАПРОСА:\n")
+            headers.getHeaders().each { prop ->
+                Header h = prop.getObjectValue() as Header
+                logMsg.append("  ${h.getName()}: ${h.getValue()}\n")
+            }
+
+            logMsg.append("\n📦 ТЕЛО ЗАПРОСА (POST data):\n")
+            Map<String, String> args = httpSampler.getArguments().getArgumentsAsMap()
+            if (args) {
+                logMsg.append("  ").append(args.collect { k, v -> "${k}=${v}" }.join("&")).append("\n")
+            } else {
+                logMsg.append("  <ПУСТО>\n")
+            }
+
+            logMsg.append("\n========== ОТВЕТ СЕРВЕРА ==========\n")
+            logMsg.append("🔢 Status Code: ${response.getResponseCode()}\n")
+            logMsg.append("📄 RESPONSE BODY:\n${responseStr}\n")
+            logMsg.append("============================================\n")
+
+            log.info(logMsg.toString())
+            // ############################################################################
+
+            // Проверяем статус из ответа
+            if (responseStr.contains(strOk)) {
+                status = true  // успех
+            } else if (!responseStr.contains(strFail)) {
+                // Если нет ни успеха, ни ошибки, значит процесс ещё не завершён — ждём и продолжаем
+                resultSampler.iteration++
+                Thread.sleep(waitMs)
+                continue
+            }
+            // Если достигли сюда, значит получен либо "Успешно завершена", либо "Завершена с ошибками"
+            // Заполняем результат и выходим из метода
+            resultSampler.showViewResultsTree(headers, httpSampler, status, response, responseStr)
+            return
+        }
+
+        // Если цикл завершился по таймауту (не было ни успеха, ни ошибки)
+        resultSampler.showViewResultsTree(headers, httpSampler, null, response, responseStr)  // null означает ошибку таймаута
+    }
+}
+
+// ==========================================================================================
+/**
+ * Вспомогательный класс, который хранит целевой SampleResult, cookie и таймаут,
+ * а также отвечает за заполнение полей результата для отображения в дереве результатов JMeter.
+ */
+@CompileStatic
+class ResultSampler {
+    private final SampleRes resultSampler   // Ссылка на SampleResult текущего сэмплера
+    protected final String cookie           // Начальное значение Cookie (может обновляться динамически, но здесь статично)
+    protected final int timeoutSec          // Таймаут в секундах
+    protected int iteration = 0               // Счётчик итераций (для логов)
+
+    ResultSampler(SampleRes resultSampler, int timeoutSec, String cookie) {
+        this.resultSampler = resultSampler
+        this.timeoutSec = timeoutSec
+        this.cookie = cookie
+    }
+
+    /**
+     * Заполняет JSR-233 SampleResult всеми необходимыми данными для просмотра в ViewResultsTree:
+     * - тело запроса (samplerData)
+     * - заголовки запроса (requestHeaders)
+     * - код ответа, успешность, сообщение, тело ответа, заголовки ответа
+     *
+     * @param headers        менеджер заголовков запроса (для вывода в дерево)
+     * @param httpSampler    сэмплер (для получения метода и URL)
+     * @param success        true — успех, false — ошибка, null — таймаут
+     * @param response       объект SampleResult ответа (может быть null при таймауте)
+     * @param responseStr    тело ответа (если передано отдельно, иначе берётся из response)
+     */
+    protected void showViewResultsTree(
+            HeaderManager headers,
+            HTTPSamplerProxy httpSampler,
+            Boolean success,
+            SampleRes response,
+            String responseStr = ""
+    ) {
+        iteration++ // увеличиваем счётчик итераций
+
+        // --- Формирование тела запроса (POST data) ---
+        StringBuilder sb = new StringBuilder("${httpSampler.getMethod()} ${httpSampler.getUrl().toString()}\n\nPOST data:\n")
+        Map<String, String> args = httpSampler.getArguments().getArgumentsAsMap()
+        if (args) {
+            sb.append(args.collect { k, v -> "${k}=${v}" }.join("&"))
+        }
+        sb.append("\n\nCookie Data:\n${cookie}")
+        resultSampler.setSamplerData(sb.toString())   // Устанавливаем тело запроса для отображения в Request
+
+        // --- Формирование заголовков запроса ---
+        sb.setLength(0)  // очищаем StringBuilder
+        headers.getHeaders().each { prop ->
+            Header h = prop.getObjectValue() as Header
+            sb.append("${h.getName()}: ${h.getValue()}\n")
+        }
+        resultSampler.setRequestHeaders(sb.toString()) // Устанавливаем заголовки запроса
+
+        // --- Заполнение полей ответа в зависимости от статуса ---
+        if (success == null) {
+            // Таймаут: ответа нет или он неполный
+            resultSampler.setResponseCode(response ? response.getResponseCode() : "-1")
+            resultSampler.setSuccessful(false)
+            resultSampler.setResponseMessage(" Таймаут(${timeoutSec} сек) ожидания ответа импорта от сервера, итерация=${iteration}")
+            resultSampler.setResponseData(
+                    responseStr ?: (response ? response.getResponseDataAsString() : "TIMEOUT ERROR"),
+                    "UTF-8"
+            )
+        } else {
+            // Успех или ошибка (обработка завершена)
+            resultSampler.setResponseCode(response.getResponseCode())
+            resultSampler.setSuccessful(success)
+            resultSampler.setResponseMessage(" статус=${success}, итерация=${iteration}")
+            resultSampler.setResponseData(
+                    responseStr ?: response.getResponseDataAsString(),
+                    "UTF-8"
+            )
+        }
+
+        // --- Формирование заголовков ответа (из реального ответа) ---
+        sb.setLength(0)  // очищаем StringBuilder
+        ;(response ? response.getResponseHeaders() : "").eachLine { line ->
+            if (line.trim()) {
+                sb.append(line.trim()).append("\n")
+            }
+        }
+        resultSampler.setResponseHeaders(sb.toString()) // Устанавливаем заголовки ответа
+    }
+}
+
+// ==========================================================================================
+// Сохраняем класс GetDummy в свойства JMeter для возможности вызова из других элементов
+Dummy.log = log
+props.put("GetDummy", GetDummy)
