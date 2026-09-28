@@ -1,0 +1,334 @@
+/**
+ * VER 2.0
+ * Класс для извлечения UUID (уникальных идентификаторов) из ответов ZK-приложения.
+ * Результат сохраняется в переменную JMeter (vars) и возвращается как строка.
+ * Скрипт предназначен для использования в JSR223 PostProcessor / Sampler в Apache JMeter.
+ * Основная задача — парсить большие JSON/JS-ответы ZK Framework и извлекать идентификаторы
+ * элементов дерева навигации и других компонентов по текстовым меткам или границам.
+ */
+
+import groovy.transform.CompileStatic
+import org.apache.jmeter.threads.JMeterVariables
+import org.apache.jmeter.samplers.SampleResult
+import org.slf4j.Logger
+import org.apache.commons.text.StringEscapeUtils
+
+
+// ####################################################################################################################################################################
+/**
+ * Статическая карта транслитерации кириллицы в латиницу. Используется для генерации "чистых" имён переменных JMeter из русских текстовых меток.
+ * Например: "Операции по кассовым выплатам" → "Operatsii_po_kassovym_vyplatam"
+ */
+@CompileStatic
+class Translit {
+    /** Статическая неизменяемая карта соответствия символов */
+    private static final Map<Character, String> MAP = new HashMap<>()
+    static {
+        MAP.put('А' as char, 'A'); MAP.put('Б' as char, 'B'); MAP.put('В' as char, 'V'); MAP.put('Г' as char, 'G'); MAP.put('Д' as char, 'D'); MAP.put('Е' as char, 'E')
+        MAP.put('Ё' as char, 'Yo'); MAP.put('Ж' as char, 'Zh'); MAP.put('З' as char, 'Z'); MAP.put('И' as char, 'I'); MAP.put('Й' as char, 'Y'); MAP.put('К' as char, 'K')
+        MAP.put('Л' as char, 'L'); MAP.put('М' as char, 'M'); MAP.put('Н' as char, 'N'); MAP.put('О' as char, 'O'); MAP.put('П' as char, 'P'); MAP.put('Р' as char, 'R')
+        MAP.put('С' as char, 'S'); MAP.put('Т' as char, 'T'); MAP.put('У' as char, 'U'); MAP.put('Ф' as char, 'F'); MAP.put('Х' as char, 'Kh'); MAP.put('Ц' as char, 'Ts')
+        MAP.put('Ч' as char, 'Ch'); MAP.put('Ш' as char, 'Sh'); MAP.put('Щ' as char, 'Shch'); MAP.put('Ъ' as char, ''); MAP.put('Ы' as char, 'Y'); MAP.put('Ь' as char, '')
+        MAP.put('Э' as char, 'E'); MAP.put('Ю' as char, 'Yu'); MAP.put('Я' as char, 'Ya')
+        MAP.put('а' as char, 'a'); MAP.put('б' as char, 'b'); MAP.put('в' as char, 'v');  MAP.put('г' as char, 'g'); MAP.put('д' as char, 'd'); MAP.put('е' as char, 'e')
+        MAP.put('ё' as char, 'yo'); MAP.put('ж' as char, 'zh'); MAP.put('з' as char, 'z');  MAP.put('и' as char, 'i'); MAP.put('й' as char, 'y'); MAP.put('к' as char, 'k')
+        MAP.put('л' as char, 'l'); MAP.put('м' as char, 'm'); MAP.put('н' as char, 'n');  MAP.put('о' as char, 'o'); MAP.put('п' as char, 'p'); MAP.put('р' as char, 'r')
+        MAP.put('с' as char, 's'); MAP.put('т' as char, 't'); MAP.put('у' as char, 'u');  MAP.put('ф' as char, 'f'); MAP.put('х' as char, 'kh'); MAP.put('ц' as char, 'ts')
+        MAP.put('ч' as char, 'ch'); MAP.put('ш' as char, 'sh'); MAP.put('щ' as char, 'shch'); MAP.put('ъ' as char, ''); MAP.put('ы' as char, 'y'); MAP.put('ь' as char, '')
+        MAP.put('э' as char, 'e'); MAP.put('ю' as char, 'yu'); MAP.put('я' as char, 'ya')
+    }
+
+    /**
+     * Транслитерация строки с кириллицы на латиницу.
+     * Алгоритм:
+     * 1. Каждый символ заменяется согласно карте MAP.
+     * 2. Все символы, не являющиеся буквами/цифрами, заменяются на подчёркивание.
+     * 3. Удаляются подряд идущие подчёркивания.
+     * 4. Удаляются подчёркивания в начале и конце строки.
+     * @param s исходная строка (может содержать кириллицу, пробелы, спецсимволы)
+     * @return "чистая" строка, пригодная для использования в качестве имени переменной JMeter
+     */
+    protected static String transliterate(String s) {
+        if (s == null || s.isEmpty()) { return s }
+        StringBuilder sb = new StringBuilder(s.length())
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i)
+            // Если символ есть в карте — берём транслитерацию, иначе оставляем как есть
+            sb.append(MAP.getOrDefault(ch, String.valueOf(ch)))
+        }
+        // Заменяем всё, кроме букв и цифр, на '_', убираем дубли и края
+        return sb.toString().replaceAll(/[^a-zA-Z0-9]/, '_').replaceAll(/_+/, '_').replaceAll(/^_|_$/, '')
+    }
+}
+
+
+// ####################################################################################################################################################################
+@CompileStatic
+class BoundaryExtractorBase {
+    /**
+     * Находит нужное вхождение правой границы и извлекает последовательность символов ID, идя назад.
+     * @param varName        имя переменной (для сообщений об ошибках)
+     * @param boundary             правая граница (текстовый маркер)
+     * @param n  порядковый номер вхождения (если номер больше реального количества — берётся последнее):
+     *                          1  = первое вхождение
+     *                          2  = второе
+     *                          -1 = последнее (по умолчанию)
+     */
+    protected static String extractBackward(String text, String boundary, int n, String varName = null) {
+        int i = findNthOccurrence(text, boundary, n)
+        if (i == -1) { throw new IllegalStateException("Не удалось извлечь varName='${varName}': правая граница '${boundary}' (вхождение #${n}) не найдена в ответе.") }
+        int start = i  // Идём назад от найденной позиции, пока символы являются допустимыми для ID
+        while (start > 0) { if (isIdChar(text.charAt(start - 1))) { start-- } else { break } }
+        return text.substring(start, i)
+    }
+
+    /**
+     * Находит нужное вхождение левой границы и извлекает последовательность символов ID, идя вперёд.
+     * @param varName        имя переменной (для сообщений об ошибках)
+     * @param rb             правая граница (текстовый маркер)
+     * @param n  порядковый номер вхождения (если номер больше реального количества — берётся последнее):
+     *                          1  = первое вхождение
+     *                          2  = второе
+     *                          -1 = последнее (по умолчанию)
+     */
+    protected static String extractForward(String text, String boundary, int n, String varName = null) {
+        int i = findNthOccurrence(text, boundary, n)
+        if (i == -1) { throw new IllegalStateException("Не удалось извлечь varName='${varName}': левая граница '${boundary}' (вхождение #${n}) не найдена в ответе.") }
+        int start = i + boundary.length()
+        int end = start  // Идём вперёд, пока символы являются допустимыми для ID
+        int len = text.length()
+        while (end < len) { if (isIdChar(text.charAt(end))) { end++ } else { break } }
+        return text.substring(start, end)
+    }
+
+    /**
+     * Находит N-ное вхождение подстроки в строке.
+     * Правила:
+     * - n == 1, 2, 3...  → соответствующее по порядку вхождение
+     * - n <= 0           → последнее вхождение
+     * - если N-ное не найдено → возвращается последнее существующее
+     * @return индекс начала найденного вхождения или -1
+     */
+    protected static int findNthOccurrence(String text, String boundary, int n) {
+        String b = StringEscapeUtils.escapeJava(boundary)
+        if (n <= 0) { return text.lastIndexOf(b) }  // Отрицательные и нулевые значения трактуем как "последнее"
+        int count = 0
+        int idx = -1
+        while (count < n) {
+            idx = text.indexOf(b, idx + 1)
+            if (idx == -1) { return text.lastIndexOf(b) }  // N-ное вхождение не найдено — возвращаем последнее
+            count++
+        }
+        return idx
+    }
+
+    /** Проверяет, является ли символ допустимым внутри UUID/ID. Разрешённые символы: A-Z, a-z, 0-9, _, !, - */
+    protected static boolean isIdChar(char s) {
+        return (s >= (char) 'A' && s <= (char) 'Z') || (s >= (char) 'a' && s <= (char) 'z')
+                || (s >= (char) '0' && s <= (char) '9')
+                || s == (char) '_' || s == (char) '!' || s == (char) '-'
+    }
+}
+
+
+// ####################################################################################################################################################################
+/**
+ * Базовый класс для всех экстракторов.
+ * Содержит общие поля (логгер, переменные JMeter, ответ сервера) и вспомогательные методы сохранения результатов.
+ */
+@CompileStatic
+class ResponseBoundaryBase {
+    protected final Logger log  /** Логгер JMeter (org.slf4j.Logger) — используется для вывода отладочной информации */
+    protected final JMeterVariables vars  /** Переменные текущего потока выполнения JMeter (vars) */
+    protected final SampleResult prev  /** Результат последнего выполненного сэмплера (prev) — источник ответа сервера */
+    protected boolean printMode  /** Флаг: выводить ли в лог каждую успешно созданную переменную */
+    protected final String response  /** Тело ответа сервера в виде строки (кэшируется при создании объекта) */
+
+    /**
+     * Конструктор базового класса.
+     * @param log          логгер JMeter
+     * @param vars         переменные текущего потока
+     * @param prev         результат последнего сэмплера
+     * @param printMode    true — логировать каждую созданную переменную
+     * @param testResponse опциональная строка ответа (для unit-тестов). Если передана — используется вместо prev.getResponseDataAsString()
+     */
+    ResponseBoundaryBase(Logger log, JMeterVariables vars, SampleResult prev, boolean printMode, String testResponse) {
+        this.log = log
+        this.vars = vars
+        this.prev = prev
+        this.printMode = printMode
+        // Приоритет: testResponse > prev > ошибка
+        if (testResponse != null) { this.response = testResponse }
+        else if (prev != null) { this.response = prev.getResponseDataAsString() }
+        else {
+            this.response = null
+            throw new IllegalStateException("Критическая ошибка: prev == null и testResponse не передан. Парсить нечего.")
+        }
+    }
+
+    /**
+     * Сохраняет извлечённый идентификатор в переменные JMeter. При включённом printMode дополнительно логирует результат.
+     * @param varName      имя переменной JMeter
+     * @param extractedId  извлечённый UUID / ID
+     * @throws IllegalStateException если extractedId пустой
+     */
+    protected void varsPut(String varName, String extractedId) {
+        if (!extractedId) { throw new IllegalStateException("Для '${varName}' извлечен пустой ID.") }
+        vars.put(varName, extractedId)
+        if (printMode) { logVar(varName, extractedId) }
+    }
+
+    /** Логирует успешно созданную переменную в формате: ### СОЗДАНА 'varName' = 'extractedId' */
+    public void logVar(String varName, String extractedId) { log.info(" ### СОЗДАНА '{}' = '{}' ", varName, extractedId) }
+    /** Вспомогательный метод для отладки: выводит транслитерированное имя и исходную текстовую метку. */
+    public void printVarName(String bound) { log.info(" >>> '{}' для '{}' ", Translit.transliterate(bound), bound) }
+}
+
+
+// ####################################################################################################################################################################
+/**
+ * Основной класс извлечения идентификаторов по границам (Left Boundary / Right Boundary).
+ * Реализует поиск UUID/ID относительно текстовых маркеров в ответе.
+ */
+@CompileStatic
+class Extractor extends ResponseBoundaryBase {
+    Extractor(Logger log, JMeterVariables vars, SampleResult prev, boolean printMode, String testResponse) { super(log, vars, prev, printMode, testResponse) }
+
+    /**
+     * Извлекает ID, идя НАЗАД от N-ного вхождения границы.
+     * RESPONSE: "a1:'var1','v2'; a2:'var2','v2'; a3:'var3','v2'"
+     *  byRB("id", "','v2'", -1) -> ${id}="var3"
+     *  byRB("id", "','v2'", 2) -> ${id}="var2"
+     */
+    public String byRB(String varName, String rb, int n = -1) {
+        vars.remove(varName)
+        String v = BoundaryExtractorBase.extractBackward(response, rb, n, varName)
+        vars.put(varName, v)
+        return v
+    }
+    /**
+     * Извлекает ID, идя ВПЕРЁД от N-ного вхождения границы.
+     * RESPONSE: "a1:'var1','v2'; a2:'var2','v2'; a2:'var3','v2'"
+     *  byLB("id", "a2:'", -1) -> ${id}="var2"
+     *  byLB("id", "a2:'", 1) -> ${id}="var2"
+     */
+    public String byLB(String varName, String lb, int n = -1) {
+        vars.remove(varName)
+        String v = BoundaryExtractorBase.extractForward(response, lb, n, varName)
+        vars.put(varName, v)
+        return v
+    }
+
+    /**
+     * Извлекает ID, между не примыкающим вплотную к ID текстом справа от ID, и левой границей.
+     * Алгоритм:
+     *  1. Находим (nr): N-ное(-1 = последнее) вхождение текста (rt), который находится ближе всего справа к ID.
+     *  2. Берём весь текст слева от него.
+     *  3. В этом тексте ищем (nl): N-ное(-1 = последнее) вхождение левой границы (lb).
+     *  4. Берём ID справа от lb.
+     * @param varName       имя переменной (для сообщений об ошибках)
+     * @param lb            левая граница
+     * @param rt            текст справа от ID, может не примыкать вплотную к ID
+     * @param nl номер вхождения левой границы:
+     *                      1  = первое вхождение
+     *                      2  = второе
+     *                      -1 = последнее (по умолчанию)
+     * @param nr номер вхождения текста справа
+     * RESPONSE: "a1:'var1','qweqw-qwsaxcz-qwe-12', 'контроль документа';"
+     *  byLbBeforeRightText("id", "a1:'", "контроль документа", -1) -> ${id}="var1"
+     */
+    public String byLbBeforeRightText(String varName, String lb, String rt, int nl = -1, int nr = -1) {
+        vars.remove(varName)
+        int i = BoundaryExtractorBase.findNthOccurrence(response, rt, nr)  // Ищем N-ное вхождение правой границы
+        if (i == -1) { throw new IllegalStateException("Не удалось извлечь varName='${varName}': не найден текст '${rt}' (вхождение #${nr})") }
+        String r = response.substring(0, i)  // Берём всё, что находится ДО найденной правой границы
+        String v = BoundaryExtractorBase.extractForward(r, lb, nl, varName)
+        vars.put(varName, v)
+        return v
+    }
+
+    /**
+     * Извлекает ID после текста слева от ID, после которой идет левая граница.
+     * Алгоритм:
+     *  1. Находим (nt): N-ное(-1 = последнее) вхождение текста (lt), который находится ближе всего слева к ID.
+     *  2. Берём весь текст справа от него.
+     *  3. В этом тексте ищем (nl): N-ное(например 1 = первое) вхождение левой границы (lb).
+     *  4. Берём ID справа от lb.
+     * RESPONSE: " 'контроль документа','qweqw-qwsaxcz-qwe-11', a1:'var1','qweqw-qwsaxcz-qwe-12';"
+     *  byTwoLb("id", "контроль документа", "a1:'", -1) -> ${id}="var1"
+     */
+    public String byTwoLb(String varName, String lt, String lb, int nt = -1, int nl = 1) {
+        vars.remove(varName)
+        int i = BoundaryExtractorBase.findNthOccurrence(response, lt, nt)  // Ищем N-ное вхождение текста слева
+        if (i == -1) { throw new IllegalStateException("Не удалось извлечь varName='${varName}': не найден текст '${lt}' (вхождение #${nt})") }
+        String r = response.substring(i + lt.length())  // Берём всё, что находится ПОСЛЕ найденной левой границы
+        String v = BoundaryExtractorBase.extractForward(r, lb, nl, varName)
+        vars.put(varName, v)
+        return v
+    }
+
+    /**
+     * Извлекает ID, содержащий в себе уникальную часть varPart.
+     * Алгоритм:
+     *  1. Находим N-ное вхождение varPart в ответе.
+     *  2. Идём НАЗАД от начала varPart, пока символы валидны (isIdChar) — это prefix.
+     *  3. Идём ВПЕРЁД от конца varPart, пока символы валидны (isIdChar) — это postfix.
+     *  4. Собираем "${prefix}${varPart}${postfix}" и сохраняем в переменную varName.
+     * @param varName имя переменной JMeter
+     * @param varPart уникальная часть ID (текстовый маркер)
+     * @param n       номер вхождения (1 = первое, 2 = второе, ..., <=0 = последнее)
+     * RESPONSE: " 'контроль документа','qweqw-qwsaxcz-qwe-11', a1:'var_UNIQUE_1','qweqw-qwsaxcz-qwe-12';"
+     *  byVarUniqueNamePart("id", "_UNIQUE_", -1) -> ${id}="var_UNIQUE_1"
+     */
+    public String byVarUniqueNamePart(String varName, String varPart, int n = -1) {
+        vars.remove(varName)
+        int i = BoundaryExtractorBase.findNthOccurrence(response, varPart, n)
+        if (i == -1) { throw new IllegalStateException("Не удалось извлечь varName='${varName}': уникальная часть '${varPart}' (вхождение #${n}) не найдена в ответе.") }
+
+        // Идём назад от начала varPart — собираем prefix
+        int start = i
+        while (start > 0 && BoundaryExtractorBase.isIdChar(response.charAt(start - 1))) { start-- }
+        String prefix = response.substring(start, i)
+
+        // Идём вперёд от конца varPart — собираем postfix
+        int end = i + varPart.length()
+        int len = response.length()
+        while (end < len && BoundaryExtractorBase.isIdChar(response.charAt(end))) { end++ }
+        String postfix = response.substring(i + varPart.length(), end)
+
+        String v = prefix + varPart + postfix
+        if (!v || v.length() == varPart.length()) { throw new IllegalStateException("Для '${varName}' извлечен пустой ID.") }
+        vars.put(varName, v)
+        if (printMode) { logVar(varName, v) }
+        return v
+    }
+}
+
+// ####################################################################################################################################################################
+/**
+ * Фабрика для создания экземпляров Extractor.
+ * Регистрируется в глобальных свойствах JMeter (props), чтобы её можно было удобно вызывать из любых JSR223-элементов.
+ * Пример использования в PostProcessor:
+ *   def extractor = props.get("ResponseExtractor").getNewCls(log, vars, prev, true)
+ *   extractor.extract(Extractor.NAVIGATION, "Operatsii_po_kassovym_vyplatam", "Операции по кассовым выплатам")
+ */
+@CompileStatic
+class ResponseExtractor {
+    /**
+     * Создаёт и возвращает новый экземпляр Extractor.
+     * @param log          логгер
+     * @param vars         переменные потока
+     * @param prev         результат предыдущего сэмплера
+     * @param printMode    включить подробное логирование (по умолчанию false)
+     * @param testResponse опциональная тестовая строка ответа (для отладки)
+     */
+    static Extractor getNewCls(Logger log, JMeterVariables vars, SampleResult prev, boolean printMode = false, String testResponse = null) {
+        return new Extractor(log, vars, prev, printMode, testResponse)
+    }
+}
+
+
+// ####################################################################################################################################################################
+// Регистрация фабрики в глобальных свойствах JMeter.
+// После выполнения этого скрипта (обычно в setUp Thread Group) объект ResponseExtractor становится доступен во всех последующих JSR223-элементах через props.
+props.put("ResponseExtractor", ResponseExtractor)
